@@ -1,7 +1,10 @@
-﻿const app = require('./app');
+const { createApp } = require("./app");
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+
+const app = createApp();
 
 app.listen(PORT, () => {
-  console.log(`API server running on http://localhost:${PORT}`);
+  // eslint-disable-next-line no-console
+  console.log(`Server listening on http://localhost:${PORT}`);
 });

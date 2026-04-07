@@ -1,10 +1,19 @@
-﻿const express = require('express');
-const app = express();
+const express = require("express");
 
-app.use(express.json());
+const v1Routes = require("./routes/v1");
 
-app.get('/ping', (req, res) => {
-  res.json({ message: 'pong' });
-});
+function createApp() {
+  const app = express();
 
-module.exports = app;
+  app.use(express.json());
+
+  app.get("/ping", (req, res) => {
+    res.json({ ok: true });
+  });
+
+  app.use("/api/v1", v1Routes);
+
+  return app;
+}
+
+module.exports = { createApp };
