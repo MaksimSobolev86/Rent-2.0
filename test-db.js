@@ -1,7 +1,8 @@
-const { query } = require('./src/db');
+require("dotenv").config();
+const pool = require("./src/db");
 
 async function main() {
-  const res = await query('SELECT NOW()');
+  const res = await pool.query("SELECT NOW()");
   console.log(res.rows);
 }
 

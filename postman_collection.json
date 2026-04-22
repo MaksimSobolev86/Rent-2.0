@@ -1,0 +1,113 @@
+{
+  "info": {
+    "name": "Rent-2.0 API",
+    "description": "Локальная коллекция для Rent-2.0.\n\nПеременная коллекции `base_url` по умолчанию `http://localhost:3000`.\n\nПримеры тел POST:\n\n**POST /api/v1/clients**\n```json\n{\n  \"first_name\": \"Test\",\n  \"last_name\": \"User\",\n  \"phone\": \"+79990000000\",\n  \"role\": \"CLIENT\"\n}\n```\n\n**POST /api/v1/items** (подставьте реальный `owner_id` из ответа создания клиента)\n```json\n{\n  \"owner_id\": \"UUID_СУЩЕСТВУЮЩЕГО_КЛИЕНТА\",\n  \"title\": \"Горные лыжи\",\n  \"description\": \"Описание...\",\n  \"price_hour\": 300,\n  \"price_weekend\": 500\n}\n```\n\n**POST /api/v1/bookings**\n```json\n{\n  \"client_id\": \"UUID_КЛИЕНТА\",\n  \"item_id\": \"UUID_ВЕЩИ\",\n  \"start_at\": \"2026-04-15T03:00:00.000Z\",\n  \"end_at\": \"2026-04-15T09:00:00.000Z\",\n  \"total_price\": 300\n}\n```\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/health"
+      }
+    },
+    {
+      "name": "Clients",
+      "item": [
+        {
+          "name": "List clients",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/clients"
+          }
+        },
+        {
+          "name": "Create client",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"first_name\": \"Test\",\n  \"last_name\": \"User\",\n  \"phone\": \"+79990000000\",\n  \"role\": \"CLIENT\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/clients"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Items",
+      "item": [
+        {
+          "name": "List items",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/items"
+          }
+        },
+        {
+          "name": "Create item",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"owner_id\": \"REPLACE_WITH_CLIENT_UUID\",\n  \"title\": \"Горные лыжи\",\n  \"description\": \"Описание\",\n  \"price_hour\": 300,\n  \"price_weekend\": 500\n}"
+            },
+            "url": "{{base_url}}/api/v1/items"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Bookings",
+      "item": [
+        {
+          "name": "List bookings",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/bookings"
+          }
+        },
+        {
+          "name": "Create booking",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"client_id\": \"REPLACE_WITH_CLIENT_UUID\",\n  \"item_id\": \"REPLACE_WITH_ITEM_UUID\",\n  \"start_at\": \"2026-04-15T03:00:00.000Z\",\n  \"end_at\": \"2026-04-15T09:00:00.000Z\",\n  \"total_price\": 300\n}"
+            },
+            "url": "{{base_url}}/api/v1/bookings"
+          }
+        }
+      ]
+    }
+  ]
+}

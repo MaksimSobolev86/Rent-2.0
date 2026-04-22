@@ -1,15 +1,7 @@
-const { Pool } = require('pg');
+const { Pool } = require("pg");
 
 const pool = new Pool({
-  host: 'localhost',
-  port: 5432,
-  user: 'postgres',        // имя пользователя Postgres
-  password: 'Huaweihonor1212', // пароль, который задавал при установке
-  database: 'rent_app',    // имя базы
+  connectionString: process.env.DATABASE_URL,
 });
 
-function query(text, params) {
-  return pool.query(text, params);
-}
-
-module.exports = { query };
+module.exports = pool;

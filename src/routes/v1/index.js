@@ -1,6 +1,7 @@
 const { Router } = require("express");
 
 const { mockAuth } = require("../../middlewares/mockAuth");
+const clientsRoutes = require("./clients.routes");
 const itemsRoutes = require("./items.routes");
 const bookingsRoutes = require("./bookings.routes");
 const meRoutes = require("./me.routes");
@@ -11,6 +12,7 @@ const router = Router();
 
 router.use(mockAuth);
 
+router.use("/clients", clientsRoutes);
 router.use("/items", itemsRoutes);
 router.use("/bookings", bookingsRoutes);
 router.use("/me", meRoutes);
