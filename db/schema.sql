@@ -11,17 +11,44 @@ CREATE TABLE IF NOT EXISTS clients (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS owners (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email       TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  first_name  TEXT NOT NULL,
+  last_name   TEXT NOT NULL,
+  phone       TEXT,
+  photo_url   TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS items (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id       UUID NOT NULL REFERENCES clients(id),
-  title          TEXT NOT NULL,
+  owner_id       UUID NOT NULL REFERENCES owners(id),
+  name           TEXT NOT NULL,
   description    TEXT,
+  status         TEXT,
   photo_url      TEXT,
   video_url      TEXT,
-  price_hour     NUMERIC(10,2),
-  price_weekend  NUMERIC(10,2),
-  is_hidden      BOOLEAN NOT NULL DEFAULT false,
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+  is_for_sale    BOOLEAN NOT NULL DEFAULT false,
+  is_for_rent    BOOLEAN NOT NULL DEFAULT false,
+  sale_price     NUMERIC(10,2),
+  weekday_price_hour  NUMERIC(10,2),
+  weekday_price_week  NUMERIC(10,2),
+  weekday_price_month NUMERIC(10,2),
+  weekend_price_hour  NUMERIC(10,2),
+  weekend_price_week  NUMERIC(10,2),
+  weekend_price_month NUMERIC(10,2),
+  holiday_price_hour  NUMERIC(10,2),
+  holiday_price_week  NUMERIC(10,2),
+  holiday_price_month NUMERIC(10,2),
+  price          NUMERIC(10,2),
+  price_per_hour NUMERIC(10,2),
+  price_per_week NUMERIC(10,2),
+  price_per_month NUMERIC(10,2),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS bookings (
@@ -33,6 +60,13 @@ CREATE TABLE IF NOT EXISTS bookings (
   status       TEXT NOT NULL DEFAULT 'pending',
   total_price  NUMERIC(10,2),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS owner_clients (
+  owner_id    UUID NOT NULL REFERENCES owners(id),
+  client_id   UUID NOT NULL REFERENCES clients(id),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (owner_id, client_id)
 );
 
 CREATE TABLE IF NOT EXISTS bases (

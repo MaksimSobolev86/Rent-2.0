@@ -2,8 +2,21 @@ const { randomUUID } = require("crypto");
 
 const pool = require("../../db");
 
+async function ensureOwnerClientsTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS owner_clients (
+       owner_id UUID NOT NULL REFERENCES owners(id),
+       client_id UUID NOT NULL REFERENCES clients(id),
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       PRIMARY KEY (owner_id, client_id)
+     );`,
+    [],
+  );
+}
+
 async function createBooking(req, res) {
   try {
+    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
     const b = req.body || {};
     const clientId = b.client_id ?? b.clientId;
     const itemId = b.item_id ?? b.itemId;
@@ -46,13 +59,26 @@ async function createBooking(req, res) {
     }
 
     const itemCheck = await pool.query(
-      `SELECT 1
+      `SELECT owner_id
        FROM items
-       WHERE id = $1 AND is_hidden = false;`,
+       WHERE id = $1;`,
       [itemId],
     );
     if (itemCheck.rowCount === 0) {
       return res.status(404).json({ error: "Item not found" });
+    }
+    if (ownerId && itemCheck.rows[0].owner_id !== ownerId) {
+      return res.status(403).json({ error: "Cannot create booking for foreign owner item" });
+    }
+
+    if (itemCheck.rows[0].owner_id) {
+      await ensureOwnerClientsTable();
+      await pool.query(
+        `INSERT INTO owner_clients (owner_id, client_id)
+         VALUES ($1, $2)
+         ON CONFLICT (owner_id, client_id) DO NOTHING;`,
+        [itemCheck.rows[0].owner_id, clientId],
+      );
     }
 
     const conflict = await pool.query(
@@ -153,11 +179,14 @@ async function cancelMyBooking(req, res) {
 
 async function listBookings(req, res) {
   try {
+    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
     const result = await pool.query(
-      `SELECT id, client_id, item_id, start_at, end_at, status, total_price, created_at
-       FROM bookings
+      `SELECT b.id, b.client_id, b.item_id, b.start_at, b.end_at, b.status, b.total_price, b.created_at
+       FROM bookings b
+       JOIN items i ON i.id = b.item_id
+       WHERE ($1::uuid IS NULL OR i.owner_id = $1::uuid)
        ORDER BY created_at DESC;`,
-      [],
+      [ownerId],
     );
 
     const bookings = result.rows.map((r) => ({
