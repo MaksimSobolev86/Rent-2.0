@@ -9,6 +9,7 @@ const ownersRoutes = require("./owners.routes");
 const authRoutes = require("./auth.routes");
 const ownerItemsRoutes = require("./owner/items.routes");
 const ownerBookingsRoutes = require("./owner/bookings.routes");
+const ownerSettingsRoutes = require("./owner/settings.routes");
 
 const router = Router();
 
@@ -23,6 +24,7 @@ router.use("/auth", authRoutes);
 
 router.use("/owner/items", ownerItemsRoutes);
 router.use("/owner/bookings", ownerBookingsRoutes);
+router.use("/owner", ownerSettingsRoutes);
 
 module.exports = router;
 

@@ -63,10 +63,27 @@ CREATE TABLE IF NOT EXISTS bookings (
 );
 
 CREATE TABLE IF NOT EXISTS owner_clients (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_id    UUID NOT NULL REFERENCES owners(id),
   client_id   UUID NOT NULL REFERENCES clients(id),
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (owner_id, client_id)
+  UNIQUE (owner_id, client_id)
+);
+
+CREATE TABLE IF NOT EXISTS owner_holidays (
+  id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id  UUID NOT NULL REFERENCES owners(id),
+  date      DATE NOT NULL,
+  name      TEXT,
+  UNIQUE (owner_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS owner_weekday_rules (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id   UUID NOT NULL REFERENCES owners(id),
+  weekday    SMALLINT NOT NULL,
+  is_weekend BOOLEAN NOT NULL,
+  UNIQUE (owner_id, weekday)
 );
 
 CREATE TABLE IF NOT EXISTS bases (

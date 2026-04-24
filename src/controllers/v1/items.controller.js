@@ -1,7 +1,7 @@
 const { parseISODateOnly, toTime } = require("../../utils/dates");
 const pool = require("../../db");
 const { randomUUID } = require("crypto");
-const { resolveRentalPrice } = require("../../utils/itemPricing");
+const { resolveRentalPrice, resolveOwnerRentalPrice } = require("../../utils/itemPricing");
 let dealTypeColumnExistsCache = null;
 
 function parseDecimal(v) {
@@ -256,14 +256,18 @@ async function getItemRentalPrice(req, res) {
     const { itemId } = req.params;
     const ownerId = req.user?.id;
     const isOwner = req.user?.role === "owner";
-    const dayType = (req.query.dayType ?? "weekday").toString().toLowerCase();
+    const dayType = req.query.dayType ? req.query.dayType.toString().toLowerCase() : null;
+    const date = req.query.date ? req.query.date.toString() : null;
     const period = (req.query.period ?? "").toString().toLowerCase();
 
-    if (!["weekday", "weekend", "holiday"].includes(dayType)) {
-      return res.status(400).json({ error: "dayType must be weekday, weekend or holiday" });
-    }
     if (!["hour", "week", "month"].includes(period)) {
       return res.status(400).json({ error: "period must be hour, week or month" });
+    }
+    if (!dayType && !date) {
+      return res.status(400).json({ error: "Either dayType or date is required" });
+    }
+    if (dayType && !["weekday", "weekend", "holiday"].includes(dayType)) {
+      return res.status(400).json({ error: "dayType must be weekday, weekend or holiday" });
     }
 
     const result = await pool.query(
@@ -280,19 +284,24 @@ async function getItemRentalPrice(req, res) {
       return res.status(404).json({ error: "Item not found" });
     }
 
-    const row = result.rows[0];
+    const row = mapItemRow(result.rows[0]);
     if (!row.is_for_rent) {
       return res.status(400).json({ error: "Item is not configured for rent" });
     }
 
-    const price = resolveRentalPrice(row, dayType, period);
+    const resolved = date
+      ? await resolveOwnerRentalPrice(pool, row.ownerId, row, date, period)
+      : { dayType, price: resolveRentalPrice(row, dayType, period) };
+    const resolvedDayType = resolved.dayType;
+    const price = resolved.price;
     if (price == null) {
       return res.status(404).json({ error: "No rental price configured for requested period" });
     }
 
     return res.json({
       itemId: row.id,
-      dayType,
+      dayType: resolvedDayType,
+      date: date ?? null,
       period,
       price,
       currency: "RUB",

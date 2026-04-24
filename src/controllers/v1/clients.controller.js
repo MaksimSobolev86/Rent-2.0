@@ -5,10 +5,11 @@ const pool = require("../../db");
 async function ensureOwnerClientsTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS owner_clients (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        owner_id UUID NOT NULL REFERENCES owners(id),
        client_id UUID NOT NULL REFERENCES clients(id),
        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-       PRIMARY KEY (owner_id, client_id)
+       UNIQUE (owner_id, client_id)
      );`,
     [],
   );
