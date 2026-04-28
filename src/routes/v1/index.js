@@ -7,9 +7,11 @@ const bookingsRoutes = require("./bookings.routes");
 const meRoutes = require("./me.routes");
 const ownersRoutes = require("./owners.routes");
 const authRoutes = require("./auth.routes");
+const eventsRoutes = require("./events.routes");
 const ownerItemsRoutes = require("./owner/items.routes");
 const ownerBookingsRoutes = require("./owner/bookings.routes");
 const ownerSettingsRoutes = require("./owner/settings.routes");
+const ownerEventsRoutes = require("./owner/events.routes");
 
 const router = Router();
 
@@ -21,9 +23,11 @@ router.use("/bookings", bookingsRoutes);
 router.use("/me", meRoutes);
 router.use("/owners", ownersRoutes);
 router.use("/auth", authRoutes);
+router.use("/events", eventsRoutes);
 
 router.use("/owner/items", ownerItemsRoutes);
 router.use("/owner/bookings", ownerBookingsRoutes);
+router.use("/owner/events", ownerEventsRoutes);
 router.use("/owner", ownerSettingsRoutes);
 
 module.exports = router;

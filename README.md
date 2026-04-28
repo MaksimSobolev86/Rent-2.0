@@ -53,3 +53,16 @@ Node.js + Express, PostgreSQL.
 | POST | `/api/v1/bookings` | Создание брони (`client_id`, `item_id`, `start_at`, `end_at`, опционально `total_price`) |
 
 Подключение к PostgreSQL: пул `pg` через `DATABASE_URL` (см. `src/db.js`), переменные окружения загружаются в `src/server.js` через `dotenv`.
+
+## Media & Events
+
+- `events.status` хранит только `draft | published | cancelled`.
+- Производные состояния (`isFinished`, `isFull`, `isRegistrationClosed`) считаются в коде и не пишутся в БД.
+- Для медиа используется единая таблица `media`:
+  - `owner_id` — владелец медиа;
+  - `target_type` — тип сущности (`item` или `event`);
+  - `target_id` — UUID сущности;
+  - `url`, `type`, `sort_order`.
+- API для вещей и событий использует единый контракт поля `media`:
+  - массив `{ id, url, type, sortOrder }`;
+  - на update при переданном `media` список заменяется целиком.

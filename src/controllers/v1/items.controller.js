@@ -27,7 +27,74 @@ function isUuid(value) {
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function mapItemRow(r) {
+function parseItemMedia(rawMedia) {
+  if (rawMedia == null) return { media: null, error: null };
+  if (!Array.isArray(rawMedia)) {
+    return { media: null, error: "media must be an array" };
+  }
+  const parsed = [];
+  for (let i = 0; i < rawMedia.length; i += 1) {
+    const media = rawMedia[i] || {};
+    const url = typeof media.url === "string" ? media.url.trim() : "";
+    const type = typeof media.type === "string" ? media.type.trim().toLowerCase() : "";
+    const sortOrderRaw = media.sortOrder ?? media.sort_order ?? 0;
+    const sortOrder = Number(sortOrderRaw);
+    if (!url) return { media: null, error: `media[${i}].url is required` };
+    if (!["image", "video"].includes(type)) return { media: null, error: `media[${i}].type must be image or video` };
+    if (!Number.isInteger(sortOrder)) return { media: null, error: `media[${i}].sortOrder must be an integer` };
+    parsed.push({ url, type, sortOrder });
+  }
+  return { media: parsed, error: null };
+}
+
+async function replaceItemMedia(client, ownerId, itemId, media) {
+  await client.query(
+    `DELETE FROM media
+     WHERE owner_id = $1
+       AND target_type = 'item'
+       AND target_id = $2;`,
+    [ownerId, itemId],
+  );
+  if (!media || media.length === 0) return;
+  const values = [];
+  const placeholders = [];
+  media.forEach((m, index) => {
+    const base = index * 5;
+    placeholders.push(`($${base + 1}, $${base + 2}, 'item', $${base + 3}, $${base + 4}, $${base + 5})`);
+    values.push(ownerId, itemId, m.url, m.type, m.sortOrder);
+  });
+  await client.query(
+    `INSERT INTO media (owner_id, target_id, target_type, url, type, sort_order)
+     VALUES ${placeholders.join(", ")};`,
+    values,
+  );
+}
+
+async function fetchItemMediaMap(client, itemIds, ownerId = null) {
+  if (!itemIds.length) return new Map();
+  const mediaRes = await client.query(
+    `SELECT id, target_id, url, type, sort_order
+     FROM media
+     WHERE target_type = 'item'
+       AND target_id = ANY($1::uuid[])
+       AND ($2::uuid IS NULL OR owner_id = $2::uuid)
+     ORDER BY target_id, sort_order ASC, created_at ASC;`,
+    [itemIds, ownerId],
+  );
+  const map = new Map();
+  mediaRes.rows.forEach((row) => {
+    if (!map.has(row.target_id)) map.set(row.target_id, []);
+    map.get(row.target_id).push({
+      id: row.id,
+      url: row.url,
+      type: row.type,
+      sortOrder: row.sort_order,
+    });
+  });
+  return map;
+}
+
+function mapItemRow(r, mediaMap = new Map()) {
   const inferredDealType = r.deal_type ?? (r.price_per_hour != null || r.price_per_week != null || r.price_per_month != null ? "rent" : "sale");
   return {
     id: r.id,
@@ -38,10 +105,6 @@ function mapItemRow(r) {
     deal_type: inferredDealType,
     description: r.description ?? "",
     status: r.status ?? null,
-    photoUrl: r.photo_url ?? null,
-    photo_url: r.photo_url ?? null,
-    videoUrl: r.video_url ?? null,
-    video_url: r.video_url ?? null,
     isForSale: Boolean(r.is_for_sale),
     is_for_sale: Boolean(r.is_for_sale),
     isForRent: Boolean(r.is_for_rent),
@@ -77,6 +140,7 @@ function mapItemRow(r) {
     created_at: r.created_at,
     updatedAt: r.updated_at,
     updated_at: r.updated_at,
+    media: mediaMap.get(r.id) ?? [],
   };
 }
 
@@ -105,8 +169,7 @@ function parseItemPayload(body) {
   const dealType = b.deal_type ?? b.dealType;
   const description = b.description;
   const status = b.status;
-  const photoUrl = b.photo_url ?? b.photoUrl;
-  const videoUrl = b.video_url ?? b.videoUrl;
+  const media = b.media;
   const isForSale = parseBoolean(b.is_for_sale ?? b.isForSale);
   const isForRent = parseBoolean(b.is_for_rent ?? b.isForRent);
   const salePrice = parseDecimal(b.sale_price ?? b.salePrice);
@@ -130,8 +193,7 @@ function parseItemPayload(body) {
     dealType,
     description,
     status,
-    photoUrl,
-    videoUrl,
+    media,
     isForSale,
     isForRent,
     salePrice,
@@ -177,7 +239,6 @@ async function listItems(req, res) {
     const dealTypeSelect = withDealType ? ", deal_type" : "";
     const result = await pool.query(
       `SELECT id, owner_id, name${dealTypeSelect}, description, status,
-              photo_url, video_url,
               is_for_sale, is_for_rent, sale_price,
               weekday_price_hour, weekday_price_week, weekday_price_month,
               weekend_price_hour, weekend_price_week, weekend_price_month,
@@ -190,7 +251,8 @@ async function listItems(req, res) {
       [isOwner ? ownerId : null],
     );
 
-    const items = result.rows.map(mapItemRow);
+    const mediaMap = await fetchItemMediaMap(pool, result.rows.map((r) => r.id), isOwner ? ownerId : null);
+    const items = result.rows.map((r) => mapItemRow(r, mediaMap));
 
     return res.json({ items });
   } catch (err) {
@@ -321,7 +383,6 @@ async function getItemById(req, res) {
     const dealTypeSelect = withDealType ? ", deal_type" : "";
     const result = await pool.query(
       `SELECT id, owner_id, name${dealTypeSelect}, description, status,
-              photo_url, video_url,
               is_for_sale, is_for_rent, sale_price,
               weekday_price_hour, weekday_price_week, weekday_price_month,
               weekend_price_hour, weekend_price_week, weekend_price_month,
@@ -338,7 +399,8 @@ async function getItemById(req, res) {
       return res.status(404).json({ error: "Item not found" });
     }
 
-    return res.json({ item: mapItemRow(result.rows[0]) });
+    const mediaMap = await fetchItemMediaMap(pool, [result.rows[0].id], isOwner ? ownerId : null);
+    return res.json({ item: mapItemRow(result.rows[0], mediaMap) });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });
@@ -347,6 +409,7 @@ async function getItemById(req, res) {
 
 async function createItem(req, res) {
   try {
+    const payload = parseItemPayload(req.body);
     const {
       name,
       isForSale,
@@ -363,13 +426,15 @@ async function createItem(req, res) {
       holidayPriceMonth,
       description,
       status,
-      photoUrl,
-      videoUrl,
       price,
       pricePerHour,
       pricePerWeek,
       pricePerMonth,
-    } = parseItemPayload(req.body);
+    } = payload;
+    const mediaResult = parseItemMedia(payload.media);
+    if (mediaResult.error) {
+      return res.status(400).json({ error: mediaResult.error });
+    }
 
     const ownerFromAuth = req.user?.id;
     const effectiveOwnerId = ownerFromAuth;
@@ -411,18 +476,21 @@ async function createItem(req, res) {
     const id = randomUUID();
     const now = new Date();
 
-    const result = await pool.query(
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
       `INSERT INTO items (
-         id, owner_id, name, description, status, photo_url, video_url,
+         id, owner_id, name, description, status,
          is_for_sale, is_for_rent, sale_price,
          weekday_price_hour, weekday_price_week, weekday_price_month,
          weekend_price_hour, weekend_price_week, weekend_price_month,
          holiday_price_hour, holiday_price_week, holiday_price_month,
          price, price_per_hour, price_per_week, price_per_month, created_at, updated_at
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
        )
-       RETURNING id, owner_id, name, description, status, photo_url, video_url,
+       RETURNING id, owner_id, name, description, status,
                  is_for_sale, is_for_rent, sale_price,
                  weekday_price_hour, weekday_price_week, weekday_price_month,
                  weekend_price_hour, weekend_price_week, weekend_price_month,
@@ -434,8 +502,6 @@ async function createItem(req, res) {
         String(name),
         description != null ? String(description) : "",
         status != null ? String(status) : null,
-        photoUrl != null ? String(photoUrl) : null,
-        videoUrl != null ? String(videoUrl) : null,
         isForSale === true,
         isForRent === true,
         salePrice,
@@ -456,8 +522,16 @@ async function createItem(req, res) {
         now,
       ],
     );
-
-    return res.status(201).json({ item: mapItemRow(result.rows[0]) });
+      await replaceItemMedia(client, String(effectiveOwnerId), id, mediaResult.media);
+      const mediaMap = await fetchItemMediaMap(client, [id], String(effectiveOwnerId));
+      await client.query("COMMIT");
+      return res.status(201).json({ item: mapItemRow(result.rows[0], mediaMap) });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });
@@ -468,6 +542,10 @@ async function updateItem(req, res) {
   try {
     const { itemId } = req.params;
     const updates = parseItemPayload(req.body);
+    const mediaResult = parseItemMedia(updates.media);
+    if (mediaResult.error) {
+      return res.status(400).json({ error: mediaResult.error });
+    }
     const ownerId = req.user?.id;
     const isOwner = req.user?.role === "owner";
     const existing = await pool.query(
@@ -533,33 +611,34 @@ async function updateItem(req, res) {
       return res.status(400).json({ error: "At least one rent price is required when isForRent is true" });
     }
 
-    const result = await pool.query(
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
       `UPDATE items
        SET owner_id = COALESCE($2, owner_id),
            name = COALESCE($3, name),
            description = COALESCE($4, description),
            status = COALESCE($5, status),
-           photo_url = COALESCE($6, photo_url),
-           video_url = COALESCE($7, video_url),
-           is_for_sale = COALESCE($8, is_for_sale),
-           is_for_rent = COALESCE($9, is_for_rent),
-           sale_price = COALESCE($10, sale_price),
-           weekday_price_hour = COALESCE($11, weekday_price_hour),
-           weekday_price_week = COALESCE($12, weekday_price_week),
-           weekday_price_month = COALESCE($13, weekday_price_month),
-           weekend_price_hour = COALESCE($14, weekend_price_hour),
-           weekend_price_week = COALESCE($15, weekend_price_week),
-           weekend_price_month = COALESCE($16, weekend_price_month),
-           holiday_price_hour = COALESCE($17, holiday_price_hour),
-           holiday_price_week = COALESCE($18, holiday_price_week),
-           holiday_price_month = COALESCE($19, holiday_price_month),
-           price = COALESCE($20, price),
-           price_per_hour = COALESCE($21, price_per_hour),
-           price_per_week = COALESCE($22, price_per_week),
-           price_per_month = COALESCE($23, price_per_month),
+           is_for_sale = COALESCE($6, is_for_sale),
+           is_for_rent = COALESCE($7, is_for_rent),
+           sale_price = COALESCE($8, sale_price),
+           weekday_price_hour = COALESCE($9, weekday_price_hour),
+           weekday_price_week = COALESCE($10, weekday_price_week),
+           weekday_price_month = COALESCE($11, weekday_price_month),
+           weekend_price_hour = COALESCE($12, weekend_price_hour),
+           weekend_price_week = COALESCE($13, weekend_price_week),
+           weekend_price_month = COALESCE($14, weekend_price_month),
+           holiday_price_hour = COALESCE($15, holiday_price_hour),
+           holiday_price_week = COALESCE($16, holiday_price_week),
+           holiday_price_month = COALESCE($17, holiday_price_month),
+           price = COALESCE($18, price),
+           price_per_hour = COALESCE($19, price_per_hour),
+           price_per_week = COALESCE($20, price_per_week),
+           price_per_month = COALESCE($21, price_per_month),
            updated_at = now()
        WHERE id = $1
-       RETURNING id, owner_id, name, description, status, photo_url, video_url,
+       RETURNING id, owner_id, name, description, status,
                  is_for_sale, is_for_rent, sale_price,
                  weekday_price_hour, weekday_price_week, weekday_price_month,
                  weekend_price_hour, weekend_price_week, weekend_price_month,
@@ -571,8 +650,6 @@ async function updateItem(req, res) {
         updates.name != null ? String(updates.name) : null,
         updates.description != null ? String(updates.description) : null,
         updates.status != null ? String(updates.status) : null,
-        updates.photoUrl != null ? String(updates.photoUrl) : null,
-        updates.videoUrl != null ? String(updates.videoUrl) : null,
         updates.isForSale,
         updates.isForRent,
         updates.salePrice,
@@ -591,8 +668,19 @@ async function updateItem(req, res) {
         updates.pricePerMonth,
       ],
     );
-
-    return res.json({ item: mapItemRow(result.rows[0]) });
+      const effectiveMediaOwnerId = String(existing.rows[0].owner_id);
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, "media")) {
+        await replaceItemMedia(client, effectiveMediaOwnerId, itemId, mediaResult.media);
+      }
+      const mediaMap = await fetchItemMediaMap(client, [itemId], effectiveMediaOwnerId);
+      await client.query("COMMIT");
+      return res.json({ item: mapItemRow(result.rows[0], mediaMap) });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });

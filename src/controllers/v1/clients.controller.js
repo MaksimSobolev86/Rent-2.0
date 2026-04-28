@@ -226,7 +226,6 @@ async function listClientItems(req, res) {
     const ownerId = req.user?.role === "owner" ? req.user?.id : null;
     const result = await pool.query(
       `SELECT DISTINCT i.id, i.owner_id, i.name, i.description, i.status,
-              i.photo_url, i.video_url,
               i.is_for_sale, i.is_for_rent, i.sale_price,
               i.weekday_price_hour, i.weekday_price_week, i.weekday_price_month,
               i.weekend_price_hour, i.weekend_price_week, i.weekend_price_month,
@@ -241,6 +240,26 @@ async function listClientItems(req, res) {
       [clientId, ownerId],
     );
 
+    const mediaRes = await pool.query(
+      `SELECT id, owner_id, target_id, url, type, sort_order
+       FROM media
+       WHERE target_type = 'item'
+         AND target_id = ANY($1::uuid[])
+         AND ($2::uuid IS NULL OR owner_id = $2::uuid)
+       ORDER BY target_id, sort_order ASC, created_at ASC;`,
+      [result.rows.map((r) => r.id), ownerId],
+    );
+    const mediaMap = new Map();
+    mediaRes.rows.forEach((m) => {
+      if (!mediaMap.has(m.target_id)) mediaMap.set(m.target_id, []);
+      mediaMap.get(m.target_id).push({
+        id: m.id,
+        url: m.url,
+        type: m.type,
+        sortOrder: m.sort_order,
+      });
+    });
+
     const items = result.rows.map((r) => ({
       id: r.id,
       ownerId: r.owner_id,
@@ -248,10 +267,7 @@ async function listClientItems(req, res) {
       name: r.name,
       description: r.description ?? "",
       status: r.status ?? null,
-      photoUrl: r.photo_url ?? null,
-      photo_url: r.photo_url ?? null,
-      videoUrl: r.video_url ?? null,
-      video_url: r.video_url ?? null,
+      media: mediaMap.get(r.id) ?? [],
       isForSale: Boolean(r.is_for_sale),
       is_for_sale: Boolean(r.is_for_sale),
       isForRent: Boolean(r.is_for_rent),

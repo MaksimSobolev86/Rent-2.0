@@ -29,8 +29,6 @@ CREATE TABLE IF NOT EXISTS items (
   name           TEXT NOT NULL,
   description    TEXT,
   status         TEXT,
-  photo_url      TEXT,
-  video_url      TEXT,
   is_for_sale    BOOLEAN NOT NULL DEFAULT false,
   is_for_rent    BOOLEAN NOT NULL DEFAULT false,
   sale_price     NUMERIC(10,2),
@@ -49,6 +47,19 @@ CREATE TABLE IF NOT EXISTS items (
   price_per_month NUMERIC(10,2),
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS media (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id    UUID NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  target_type TEXT NOT NULL,
+  target_id   UUID NOT NULL,
+  url         TEXT NOT NULL,
+  type        TEXT NOT NULL,
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (target_type IN ('item', 'event')),
+  CHECK (type IN ('image', 'video'))
 );
 
 CREATE TABLE IF NOT EXISTS bookings (
@@ -92,3 +103,4 @@ CREATE TABLE IF NOT EXISTS bases (
   address     TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
