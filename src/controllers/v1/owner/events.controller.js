@@ -1,6 +1,8 @@
 const pool = require("../../../db");
+const { roundMoney } = require("../../../utils/money");
+const { EventStatus, EVENT_STATUS_SET } = require("../../../constants/event-status");
+const { isUuid } = require("../../../utils/ownerScope");
 
-const EVENT_STATUSES = new Set(["draft", "published", "cancelled"]);
 const INVALID_DATE = Symbol("invalid-date");
 let hasEventParticipantsTableCache = null;
 
@@ -25,6 +27,12 @@ function parseEventMedia(rawMedia) {
     }
     parsed.push({ url, type, sortOrder });
   }
+
+  const imageCount = parsed.filter((m) => m.type === "image").length;
+  if (imageCount > 6) {
+    return { media: null, error: "At most 6 images are allowed per event" };
+  }
+
   return { media: parsed, error: null };
 }
 
@@ -78,13 +86,39 @@ async function fetchEventMediaMap(client, ownerId, eventIds) {
 }
 
 function getOwnerId(req) {
-  return req.user?.ownerId ?? req.user?.id ?? null;
+  const raw = req.user?.id ?? req.user?.ownerId ?? null;
+  return isUuid(raw) ? raw : null;
+}
+
+function requireOwnerId(req, res) {
+  const ownerId = getOwnerId(req);
+  if (!ownerId) {
+    res.status(401).json({ error: "Owner authentication required" });
+    return null;
+  }
+  return ownerId;
+}
+
+/** Admin UI uses x-user-role: admin while still passing the venue owner's id in x-user-id. */
+function isAdminPanelRequest(req) {
+  return String(req.user?.role ?? "").toLowerCase() === "admin";
+}
+
+async function markPublishedEventsAsCompleted(client = pool) {
+  await client.query(
+    `UPDATE events
+     SET status = $1, updated_at = now()
+     WHERE status = $2
+       AND ends_at < now()
+       AND updated_at <= ends_at;`,
+    [EventStatus.Completed, EventStatus.Published],
+  );
 }
 
 function parseOptionalNumber(value) {
   if (value == null || value === "") return null;
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : NaN;
+  return Number.isFinite(parsed) ? roundMoney(parsed) : NaN;
 }
 
 function parseOptionalDate(value) {
@@ -209,7 +243,7 @@ function buildDerivedFlags(row) {
   const registrationDeadline = row.registration_deadline
     ? new Date(row.registration_deadline)
     : null;
-  const isRegistrationClosed = row.status !== "published"
+  const isRegistrationClosed = row.status !== EventStatus.Published
     || (registrationDeadline && now > registrationDeadline)
     || now > row.starts_at;
 
@@ -293,7 +327,11 @@ async function fetchOwnerEventWithMedia(client, eventId, ownerId) {
 
 async function createOwnerEvent(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "status")) {
+      return res.status(400).json({ error: "status is managed by lifecycle actions only" });
+    }
     const payload = normalizeEventPayload(req.body || {});
     const mediaResult = parseEventMedia(req.body?.media);
     if (mediaResult.error) {
@@ -319,7 +357,7 @@ async function createOwnerEvent(req, res) {
          $5, $6, $7, $8,
          $9, $10,
          $11, $12,
-         $13, $14, $15, 'draft'
+         $13, $14, $15, $16
        )
        RETURNING id;`,
       [
@@ -338,6 +376,7 @@ async function createOwnerEvent(req, res) {
         payload.isPrivate,
         payload.ageRestriction != null ? String(payload.ageRestriction) : null,
         payload.notesForClients != null ? String(payload.notesForClients) : null,
+        EventStatus.Draft,
       ],
     );
 
@@ -367,7 +406,8 @@ async function createOwnerEvent(req, res) {
 
 async function updateOwnerEvent(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { id } = req.params;
     const body = { ...(req.body || {}) };
     delete body.status;
@@ -474,11 +514,15 @@ async function updateOwnerEvent(req, res) {
 
 async function listOwnerEvents(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { status, includePast } = req.query;
-    if (status && !EVENT_STATUSES.has(String(status))) {
+    if (status && !EVENT_STATUS_SET.has(String(status))) {
       return res.status(400).json({ error: "Invalid status filter" });
     }
+
+    // Lazy status synchronization: past published events become completed.
+    await markPublishedEventsAsCompleted();
 
     const includePastBool = parseOptionalBoolean(includePast, false);
     const participantsEnabled = await hasEventParticipantsTable();
@@ -501,8 +545,11 @@ async function listOwnerEvents(req, res) {
 
 async function getOwnerEvent(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { id } = req.params;
+    // Lazy status synchronization: past published events become completed.
+    await markPublishedEventsAsCompleted();
     const row = await fetchOwnerEventRowById(id, ownerId);
     if (!row) {
       return res.status(404).json({ error: "Event not found" });
@@ -517,7 +564,8 @@ async function getOwnerEvent(req, res) {
 
 async function publishOwnerEvent(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { id } = req.params;
 
     const current = await pool.query(
@@ -531,19 +579,22 @@ async function publishOwnerEvent(req, res) {
     }
 
     const row = current.rows[0];
-    if (row.status === "cancelled") {
+    if (row.status === EventStatus.Completed && !isAdminPanelRequest(req)) {
+      return res.status(409).json({ error: "Completed event cannot be published" });
+    }
+    if (row.status === EventStatus.Cancelled && !isAdminPanelRequest(req)) {
       return res.status(409).json({ error: "Cancelled event cannot be published" });
     }
-    if (row.ends_at <= new Date()) {
+    if (row.ends_at <= new Date() && !isAdminPanelRequest(req)) {
       return res.status(409).json({ error: "Past event cannot be published" });
     }
 
-    if (row.status !== "published") {
+    if (row.status !== EventStatus.Published) {
       await pool.query(
         `UPDATE events
-         SET status = 'published', updated_at = now()
-         WHERE id = $1;`,
-        [id],
+         SET status = $2, updated_at = now()
+         WHERE id = $1 AND owner_id = $3;`,
+        [id, EventStatus.Published, ownerId],
       );
     }
 
@@ -556,11 +607,12 @@ async function publishOwnerEvent(req, res) {
 
 async function cancelOwnerEvent(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { id } = req.params;
 
     const exists = await pool.query(
-      `SELECT id
+      `SELECT id, status
        FROM events
        WHERE id = $1 AND owner_id = $2;`,
       [id, ownerId],
@@ -569,11 +621,15 @@ async function cancelOwnerEvent(req, res) {
       return res.status(404).json({ error: "Event not found" });
     }
 
+    if (exists.rows[0].status === EventStatus.Completed) {
+      return res.status(409).json({ error: "Completed event cannot be cancelled" });
+    }
+
     await pool.query(
       `UPDATE events
-       SET status = 'cancelled', updated_at = now()
-       WHERE id = $1 AND status <> 'cancelled';`,
-      [id],
+       SET status = $2, updated_at = now()
+       WHERE id = $1 AND owner_id = $3 AND status <> $2;`,
+      [id, EventStatus.Cancelled, ownerId],
     );
 
     return getOwnerEvent(req, res);
@@ -585,7 +641,8 @@ async function cancelOwnerEvent(req, res) {
 
 async function moveOwnerEventToDraft(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { id } = req.params;
 
     const current = await pool.query(
@@ -597,16 +654,19 @@ async function moveOwnerEventToDraft(req, res) {
     if (current.rowCount === 0) {
       return res.status(404).json({ error: "Event not found" });
     }
-    if (current.rows[0].status === "cancelled") {
+    if (current.rows[0].status === EventStatus.Completed) {
+      return res.status(409).json({ error: "Completed event cannot be moved to draft" });
+    }
+    if (current.rows[0].status === EventStatus.Cancelled && !isAdminPanelRequest(req)) {
       return res.status(409).json({ error: "Cancelled event cannot be moved to draft" });
     }
 
-    if (current.rows[0].status !== "draft") {
+    if (current.rows[0].status !== EventStatus.Draft) {
       await pool.query(
         `UPDATE events
-         SET status = 'draft', updated_at = now()
-         WHERE id = $1;`,
-        [id],
+         SET status = $2, updated_at = now()
+         WHERE id = $1 AND owner_id = $3;`,
+        [id, EventStatus.Draft, ownerId],
       );
     }
 
@@ -619,7 +679,8 @@ async function moveOwnerEventToDraft(req, res) {
 
 async function deleteOwnerEvent(req, res) {
   try {
-    const ownerId = getOwnerId(req);
+    const ownerId = requireOwnerId(req, res);
+    if (!ownerId) return;
     const { id } = req.params;
 
     const deleted = await pool.query(

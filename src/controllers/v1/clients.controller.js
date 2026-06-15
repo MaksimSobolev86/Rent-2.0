@@ -1,21 +1,27 @@
 const { randomUUID } = require("crypto");
 
 const pool = require("../../db");
+const { requireScopedOwnerId } = require("../../utils/ownerScope");
+const { ensureOwnerClientsTable } = require("../../utils/ensureAppSchema");
 
-async function ensureOwnerClientsTable() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS owner_clients (
-       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-       owner_id UUID NOT NULL REFERENCES owners(id),
-       client_id UUID NOT NULL REFERENCES clients(id),
-       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-       UNIQUE (owner_id, client_id)
-     );`,
-    [],
+async function hasEventParticipantsTable() {
+  const result = await pool.query(
+    "SELECT to_regclass('public.event_participants') IS NOT NULL AS exists;",
   );
+  return Boolean(result.rows[0]?.exists);
 }
 
 async function ownerCanAccessClient(ownerId, clientId) {
+  const participantsEnabled = await hasEventParticipantsTable();
+  const eventAccessSql = participantsEnabled
+    ? `OR EXISTS (
+         SELECT 1
+         FROM event_participants ep
+         JOIN events e ON e.id = ep.event_id
+         WHERE ep.client_id = $2 AND e.owner_id = $1
+       )`
+    : "";
+
   const access = await pool.query(
     `SELECT 1
      WHERE EXISTS (
@@ -28,15 +34,80 @@ async function ownerCanAccessClient(ownerId, clientId) {
        FROM bookings b
        JOIN items i ON i.id = b.item_id
        WHERE b.client_id = $2 AND i.owner_id = $1
-     );`,
+     )
+     OR EXISTS (
+       SELECT 1
+       FROM bookings b
+       WHERE b.client_id = $2 AND b.owner_id = $1
+     )
+     ${eventAccessSql};`,
     [ownerId, clientId],
   );
   return access.rowCount > 0;
 }
 
+function buildClientListSelect(ownerIdParam, includeEvents = true) {
+  const eventBookingsCountSql = includeEvents
+    ? `(
+      SELECT COUNT(*)
+      FROM event_participants ep_cnt
+      JOIN events e_cnt ON e_cnt.id = ep_cnt.event_id
+      WHERE ep_cnt.client_id = c.id
+        AND e_cnt.owner_id = ${ownerIdParam}::uuid
+    )`
+    : "0";
+
+  return `SELECT c.id, c.vk_user_id, c.first_name, c.last_name, c.phone, c.photo_url, c.role, c.created_at,
+              (
+                (
+                  SELECT COUNT(*)
+                  FROM bookings b2
+                  LEFT JOIN items i2 ON i2.id = b2.item_id
+                  WHERE b2.client_id = c.id
+                    AND (i2.owner_id = ${ownerIdParam}::uuid OR b2.owner_id = ${ownerIdParam}::uuid)
+                )
+                + ${eventBookingsCountSql}
+              )::int AS bookings_count,
+              (
+                SELECT COUNT(DISTINCT b3.item_id)
+                FROM bookings b3
+                JOIN items i3 ON i3.id = b3.item_id
+                WHERE b3.client_id = c.id
+                  AND i3.owner_id = ${ownerIdParam}::uuid
+              )::int AS items_count`;
+}
+
+function buildClientVisibilityWhere(ownerIdParam, includeEvents) {
+  const eventVisibilitySql = includeEvents
+    ? `OR EXISTS (
+         SELECT 1
+         FROM event_participants ep
+         JOIN events e ON e.id = ep.event_id
+         WHERE ep.client_id = c.id AND e.owner_id = ${ownerIdParam}::uuid
+       )`
+    : "";
+
+  return `(
+           EXISTS (
+             SELECT 1
+             FROM owner_clients oc
+             WHERE oc.owner_id = ${ownerIdParam}::uuid AND oc.client_id = c.id
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM bookings b
+             LEFT JOIN items i ON i.id = b.item_id
+             WHERE b.client_id = c.id
+               AND (i.owner_id = ${ownerIdParam}::uuid OR b.owner_id = ${ownerIdParam}::uuid)
+           )
+           ${eventVisibilitySql}
+         )`;
+}
+
 async function createClient(req, res) {
   try {
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
     const b = req.body || {};
     const vkUserId = b.vk_user_id ?? b.vkUserId;
     const firstName = b.first_name ?? b.firstName;
@@ -104,41 +175,14 @@ async function createClient(req, res) {
 
 async function listClients(req, res) {
   try {
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
-    if (ownerId) {
-      await ensureOwnerClientsTable();
-    }
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+    await ensureOwnerClientsTable();
+    const participantsEnabled = await hasEventParticipantsTable();
     const result = await pool.query(
-      `SELECT c.id, c.vk_user_id, c.first_name, c.last_name, c.phone, c.photo_url, c.role, c.created_at,
-              (
-                SELECT COUNT(*)
-                FROM bookings b2
-                JOIN items i2 ON i2.id = b2.item_id
-                WHERE b2.client_id = c.id
-                  AND ($1::uuid IS NULL OR i2.owner_id = $1::uuid)
-              )::int AS bookings_count,
-              (
-                SELECT COUNT(DISTINCT b3.item_id)
-                FROM bookings b3
-                JOIN items i3 ON i3.id = b3.item_id
-                WHERE b3.client_id = c.id
-                  AND ($1::uuid IS NULL OR i3.owner_id = $1::uuid)
-              )::int AS items_count
+      `${buildClientListSelect("$1", participantsEnabled)}
        FROM clients c
-       WHERE (
-         $1::uuid IS NULL
-         OR EXISTS (
-           SELECT 1
-           FROM owner_clients oc
-           WHERE oc.owner_id = $1::uuid AND oc.client_id = c.id
-         )
-         OR EXISTS (
-           SELECT 1
-           FROM bookings b
-           JOIN items i ON i.id = b.item_id
-           WHERE b.client_id = c.id AND i.owner_id = $1::uuid
-         )
-       )
+       WHERE ${buildClientVisibilityWhere("$1", participantsEnabled)}
        ORDER BY c.created_at DESC;`,
       [ownerId],
     );
@@ -166,32 +210,19 @@ async function listClients(req, res) {
 async function getClientById(req, res) {
   try {
     const { clientId } = req.params;
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
-    if (ownerId) {
-      await ensureOwnerClientsTable();
-      const canAccess = await ownerCanAccessClient(ownerId, clientId);
-      if (!canAccess) {
-        return res.status(404).json({ error: "Client not found" });
-      }
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+    await ensureOwnerClientsTable();
+    const canAccess = await ownerCanAccessClient(ownerId, clientId);
+    if (!canAccess) {
+      return res.status(404).json({ error: "Client not found" });
     }
+    const participantsEnabled = await hasEventParticipantsTable();
     const result = await pool.query(
-      `SELECT c.id, c.vk_user_id, c.first_name, c.last_name, c.phone, c.photo_url, c.role, c.created_at,
-              (
-                SELECT COUNT(*)
-                FROM bookings b2
-                JOIN items i2 ON i2.id = b2.item_id
-                WHERE b2.client_id = c.id
-                  AND ($2::uuid IS NULL OR i2.owner_id = $2::uuid)
-              )::int AS bookings_count,
-              (
-                SELECT COUNT(DISTINCT b3.item_id)
-                FROM bookings b3
-                JOIN items i3 ON i3.id = b3.item_id
-                WHERE b3.client_id = c.id
-                  AND ($2::uuid IS NULL OR i3.owner_id = $2::uuid)
-              )::int AS items_count
+      `${buildClientListSelect("$2", participantsEnabled)}
        FROM clients c
        WHERE c.id = $1
+         AND ${buildClientVisibilityWhere("$2", participantsEnabled)}
        GROUP BY c.id, c.vk_user_id, c.first_name, c.last_name, c.phone, c.photo_url, c.role, c.created_at;`,
       [clientId, ownerId],
     );
@@ -223,19 +254,24 @@ async function getClientById(req, res) {
 async function listClientItems(req, res) {
   try {
     const { clientId } = req.params;
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+    const canAccess = await ownerCanAccessClient(ownerId, clientId);
+    if (!canAccess) {
+      return res.status(404).json({ error: "Client not found" });
+    }
     const result = await pool.query(
       `SELECT DISTINCT i.id, i.owner_id, i.name, i.description, i.status,
               i.is_for_sale, i.is_for_rent, i.sale_price,
-              i.weekday_price_hour, i.weekday_price_week, i.weekday_price_month,
-              i.weekend_price_hour, i.weekend_price_week, i.weekend_price_month,
-              i.holiday_price_hour, i.holiday_price_week, i.holiday_price_month,
+              i.weekday_price_hour, i.weekday_price_day, i.weekday_price_week, i.weekday_price_month,
+              i.weekend_price_hour, i.weekend_price_day, i.weekend_price_week, i.weekend_price_month,
+              i.holiday_price_hour, i.holiday_price_day, i.holiday_price_week, i.holiday_price_month,
               i.price, i.price_per_hour, i.price_per_week, i.price_per_month,
               i.created_at, i.updated_at
        FROM items i
        JOIN bookings b ON b.item_id = i.id
        WHERE b.client_id = $1
-         AND ($2::uuid IS NULL OR i.owner_id = $2::uuid)
+         AND i.owner_id = $2::uuid
        ORDER BY i.created_at DESC;`,
       [clientId, ownerId],
     );
@@ -276,18 +312,24 @@ async function listClientItems(req, res) {
       sale_price: r.sale_price != null ? Number(r.sale_price) : null,
       weekdayPriceHour: r.weekday_price_hour != null ? Number(r.weekday_price_hour) : null,
       weekday_price_hour: r.weekday_price_hour != null ? Number(r.weekday_price_hour) : null,
+      weekdayPriceDay: r.weekday_price_day != null ? Number(r.weekday_price_day) : null,
+      weekday_price_day: r.weekday_price_day != null ? Number(r.weekday_price_day) : null,
       weekdayPriceWeek: r.weekday_price_week != null ? Number(r.weekday_price_week) : null,
       weekday_price_week: r.weekday_price_week != null ? Number(r.weekday_price_week) : null,
       weekdayPriceMonth: r.weekday_price_month != null ? Number(r.weekday_price_month) : null,
       weekday_price_month: r.weekday_price_month != null ? Number(r.weekday_price_month) : null,
       weekendPriceHour: r.weekend_price_hour != null ? Number(r.weekend_price_hour) : null,
       weekend_price_hour: r.weekend_price_hour != null ? Number(r.weekend_price_hour) : null,
+      weekendPriceDay: r.weekend_price_day != null ? Number(r.weekend_price_day) : null,
+      weekend_price_day: r.weekend_price_day != null ? Number(r.weekend_price_day) : null,
       weekendPriceWeek: r.weekend_price_week != null ? Number(r.weekend_price_week) : null,
       weekend_price_week: r.weekend_price_week != null ? Number(r.weekend_price_week) : null,
       weekendPriceMonth: r.weekend_price_month != null ? Number(r.weekend_price_month) : null,
       weekend_price_month: r.weekend_price_month != null ? Number(r.weekend_price_month) : null,
       holidayPriceHour: r.holiday_price_hour != null ? Number(r.holiday_price_hour) : null,
       holiday_price_hour: r.holiday_price_hour != null ? Number(r.holiday_price_hour) : null,
+      holidayPriceDay: r.holiday_price_day != null ? Number(r.holiday_price_day) : null,
+      holiday_price_day: r.holiday_price_day != null ? Number(r.holiday_price_day) : null,
       holidayPriceWeek: r.holiday_price_week != null ? Number(r.holiday_price_week) : null,
       holiday_price_week: r.holiday_price_week != null ? Number(r.holiday_price_week) : null,
       holidayPriceMonth: r.holiday_price_month != null ? Number(r.holiday_price_month) : null,
@@ -315,21 +357,29 @@ async function listClientItems(req, res) {
 async function listClientBookings(req, res) {
   try {
     const { clientId } = req.params;
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+    const canAccess = await ownerCanAccessClient(ownerId, clientId);
+    if (!canAccess) {
+      return res.status(404).json({ error: "Client not found" });
+    }
     const result = await pool.query(
-      `SELECT b.id, b.client_id, b.item_id, b.start_at, b.end_at, b.status, b.total_price, b.created_at
+      `SELECT b.id, b.client_id, b.item_id, b.start_at, b.end_at, b.status, b.total_price, b.created_at,
+              b.type, b.currency, i.name AS item_name
        FROM bookings b
-       JOIN items i ON i.id = b.item_id
+       LEFT JOIN items i ON i.id = b.item_id
        WHERE b.client_id = $1
-         AND ($2::uuid IS NULL OR i.owner_id = $2::uuid)
-       ORDER BY created_at DESC;`,
+         AND (i.owner_id = $2::uuid OR b.owner_id = $2::uuid)
+       ORDER BY b.created_at DESC;`,
       [clientId, ownerId],
     );
 
-    const bookings = result.rows.map((r) => ({
+    const rentBookings = result.rows.map((r) => ({
       id: r.id,
       clientId: r.client_id,
       itemId: r.item_id,
+      itemName: r.item_name ?? null,
+      type: r.type ?? "rent",
       startDate: r.start_at.toISOString().slice(0, 10),
       start_date: r.start_at.toISOString().slice(0, 10),
       endDate: r.end_at.toISOString().slice(0, 10),
@@ -337,9 +387,46 @@ async function listClientBookings(req, res) {
       status: r.status,
       totalPrice: r.total_price != null ? Number(r.total_price) : null,
       total_price: r.total_price != null ? Number(r.total_price) : null,
+      currency: r.currency ?? "RUB",
       createdAt: r.created_at,
       created_at: r.created_at,
     }));
+
+    let eventBookings = [];
+    if (await hasEventParticipantsTable()) {
+      const eventResult = await pool.query(
+        `SELECT ep.id, ep.event_id, ep.client_id, ep.note, ep.created_at,
+                e.title AS event_title, e.starts_at, e.ends_at, e.price
+         FROM event_participants ep
+         INNER JOIN events e ON e.id = ep.event_id
+         WHERE ep.client_id = $1
+           AND e.owner_id = $2::uuid
+         ORDER BY ep.created_at DESC;`,
+        [clientId, ownerId],
+      );
+      eventBookings = eventResult.rows.map((r) => ({
+        id: r.id,
+        clientId: r.client_id,
+        eventId: r.event_id,
+        itemName: r.event_title ? `Событие: ${r.event_title}` : "Событие",
+        type: "event",
+        startDate: r.starts_at.toISOString().slice(0, 10),
+        start_date: r.starts_at.toISOString().slice(0, 10),
+        endDate: r.ends_at.toISOString().slice(0, 10),
+        end_date: r.ends_at.toISOString().slice(0, 10),
+        status: "registered",
+        clientComment: r.note ?? null,
+        totalPrice: r.price != null ? Number(r.price) : null,
+        total_price: r.price != null ? Number(r.price) : null,
+        currency: "RUB",
+        createdAt: r.created_at,
+        created_at: r.created_at,
+      }));
+    }
+
+    const bookings = [...rentBookings, ...eventBookings].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
 
     return res.json({ bookings });
   } catch (err) {
@@ -352,13 +439,12 @@ async function updateClient(req, res) {
   try {
     const { clientId } = req.params;
     const b = req.body || {};
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
-    if (ownerId) {
-      await ensureOwnerClientsTable();
-      const canAccess = await ownerCanAccessClient(ownerId, clientId);
-      if (!canAccess) {
-        return res.status(404).json({ error: "Client not found" });
-      }
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+    await ensureOwnerClientsTable();
+    const canAccess = await ownerCanAccessClient(ownerId, clientId);
+    if (!canAccess) {
+      return res.status(404).json({ error: "Client not found" });
     }
 
     const existing = await pool.query(
@@ -420,13 +506,12 @@ async function updateClient(req, res) {
 async function deleteClient(req, res) {
   try {
     const { clientId } = req.params;
-    const ownerId = req.user?.role === "owner" ? req.user?.id : null;
-    if (ownerId) {
-      await ensureOwnerClientsTable();
-      const canAccess = await ownerCanAccessClient(ownerId, clientId);
-      if (!canAccess) {
-        return res.status(404).json({ error: "Client not found" });
-      }
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+    await ensureOwnerClientsTable();
+    const canAccess = await ownerCanAccessClient(ownerId, clientId);
+    if (!canAccess) {
+      return res.status(404).json({ error: "Client not found" });
     }
 
     const existing = await pool.query(

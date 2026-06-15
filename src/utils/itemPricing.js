@@ -7,7 +7,14 @@ function toNumericOrNull(value) {
 function resolveRentalPrice(item, dayType, period) {
   const normalizedDay = (dayType || "weekday").toLowerCase();
   const normalizedPeriod = period.toLowerCase();
-  const suffix = normalizedPeriod === "hour" ? "Hour" : normalizedPeriod === "week" ? "Week" : "Month";
+  const suffix =
+    normalizedPeriod === "hour"
+      ? "Hour"
+      : normalizedPeriod === "day"
+        ? "Day"
+        : normalizedPeriod === "week"
+          ? "Week"
+          : "Month";
 
   const weekdayPrice = toNumericOrNull(item[`weekdayPrice${suffix}`] ?? item[`weekday_price_${normalizedPeriod}`]);
   const dayPrice = toNumericOrNull(item[`${normalizedDay}Price${suffix}`] ?? item[`${normalizedDay}_price_${normalizedPeriod}`]);

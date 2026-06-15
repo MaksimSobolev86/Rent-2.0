@@ -1,12 +1,16 @@
 const pool = require("../../db");
+const { requireScopedOwnerId } = require("../../utils/ownerScope");
 
 async function listOwners(req, res) {
   try {
+    const ownerId = requireScopedOwnerId(req, res);
+    if (!ownerId) return;
+
     const result = await pool.query(
-      `SELECT id, email, first_name, last_name, phone, created_at, updated_at
+      `SELECT id, email, first_name, last_name, phone, photo_url, created_at, updated_at
        FROM owners
-       ORDER BY created_at DESC;`,
-      [],
+       WHERE id = $1;`,
+      [ownerId],
     );
 
     const owners = result.rows.map((r) => ({
@@ -17,6 +21,7 @@ async function listOwners(req, res) {
       lastName: r.last_name,
       last_name: r.last_name,
       phone: r.phone,
+      photoUrl: r.photo_url,
       createdAt: r.created_at,
       created_at: r.created_at,
       updatedAt: r.updated_at,

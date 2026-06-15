@@ -30,6 +30,8 @@ Node.js + Express, PostgreSQL.
 
    Команда идемпотентна за счёт `CREATE TABLE IF NOT EXISTS`. Если в базе уже были **другие** определения этих таблиц (другие колонки), сначала удалите старые таблицы или создайте чистую базу — иначе `CREATE TABLE` не изменит структуру существующих таблиц.
 
+   Для существующих баз дополнительно применяйте файлы из `db/migrations/` по порядку (например `014_drop_bases_and_legacy_map_keys.sql`, `015_create_events_tables.sql`). При старте сервер также вызывает `ensureAppSchema()` — создаёт недостающие таблицы (`events`, `favorites`, `owner_clients` и др.), но **не** удаляет устаревшие объекты; для этого нужны миграции.
+
 5. Запуск в режиме разработки (порт по умолчанию **3000**):
 
    ```bash
@@ -53,6 +55,28 @@ Node.js + Express, PostgreSQL.
 | POST | `/api/v1/bookings` | Создание брони (`client_id`, `item_id`, `start_at`, `end_at`, опционально `total_price`) |
 
 Подключение к PostgreSQL: пул `pg` через `DATABASE_URL` (см. `src/db.js`), переменные окружения загружаются в `src/server.js` через `dotenv`.
+
+## Изоляция данных владельцев
+
+После `POST /api/v1/auth/owner/login` API возвращает `token` (JWT). Админка (`Frontend_admin`) отправляет `Authorization: Bearer <token>` — все запросы к `/owner/*` и `/clients/*` видят только данные этого владельца.
+
+Публичный каталог VK: `GET /api/v1/items?ownerId=<uuid>` и `GET /api/v1/events?ownerId=<uuid>` — без `ownerId` вернётся ошибка 400.
+
+В `.env` задайте `JWT_SECRET` для продакшена.
+
+## Загрузка изображений
+
+- `POST /api/v1/owner/uploads/image` — `multipart/form-data`, поле **`file`** (требуется JWT владельца).
+- Сервер сжимает в **WebP** (до 1600px по длинной стороне) и сохраняет в `uploads/<ownerId>/`.
+- Ответ: `{ url, width, height, size, format }`, где `url` вида `/uploads/<ownerId>/<file>.webp`.
+- Файлы отдаются по `GET /uploads/...` (статика Express).
+
+Переменные окружения (см. `.env.example`):
+
+- `PUBLIC_BASE_URL` — публичный origin API (например `https://api.example.com`), чтобы в ответах профиля и магазина URL были абсолютными для VK Mini Apps.
+- `UPLOADS_DIR`, `UPLOAD_MAX_INPUT_BYTES`, `UPLOAD_MAX_EDGE`, `UPLOAD_WEBP_QUALITY` — опционально.
+
+В профиле владельца (`photoUrl`, `shopPhotoUrl`) допустимы пути `/uploads/<ваш-owner-id>/...`, `https://...` или короткий `data:` (legacy).
 
 ## Media & Events
 

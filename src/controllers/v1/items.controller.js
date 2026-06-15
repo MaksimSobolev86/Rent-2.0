@@ -1,13 +1,31 @@
 const { parseISODateOnly, toTime } = require("../../utils/dates");
+const { getScopedOwnerId, isOwnerLikeRole, resolveCatalogOwnerId } = require("../../utils/ownerScope");
 const pool = require("../../db");
 const { randomUUID } = require("crypto");
 const { resolveRentalPrice, resolveOwnerRentalPrice } = require("../../utils/itemPricing");
-let dealTypeColumnExistsCache = null;
+const { clientCatalogStatusSql } = require("../../utils/itemCatalog");
+const { hasDealTypeColumn } = require("../../utils/itemSchema");
+const { ensureItemGroupsSchema } = require("../../utils/ensureItemGroupsSchema");
+const { roundMoney } = require("../../utils/money");
+
+const CATALOG_ITEM_SELECT = `
+  i.id, i.owner_id, i.name, i.description, i.status,
+  i.is_for_sale, i.is_for_rent, i.sale_price,
+  i.weekday_price_hour, i.weekday_price_day, i.weekday_price_week, i.weekday_price_month,
+  i.weekend_price_hour, i.weekend_price_day, i.weekend_price_week, i.weekend_price_month,
+  i.holiday_price_hour, i.holiday_price_day, i.holiday_price_week, i.holiday_price_month,
+  i.price, i.price_per_hour, i.price_per_day, i.price_per_week, i.price_per_month,
+  i.group_id, g.name AS group_name,
+  i.created_at, i.updated_at`;
+
+const CATALOG_ITEM_FROM = `
+  FROM items i
+  LEFT JOIN item_groups g ON g.id = i.group_id AND g.owner_id = i.owner_id`;
 
 function parseDecimal(v) {
   if (v == null || v === "") return null;
   const n = Number(v);
-  return Number.isFinite(n) ? n : NaN;
+  return Number.isFinite(n) ? roundMoney(n) : NaN;
 }
 
 function parseBoolean(v, fallback = null) {
@@ -95,71 +113,119 @@ async function fetchItemMediaMap(client, itemIds, ownerId = null) {
 }
 
 function mapItemRow(r, mediaMap = new Map()) {
-  const inferredDealType = r.deal_type ?? (r.price_per_hour != null || r.price_per_week != null || r.price_per_month != null ? "rent" : "sale");
+  const isForSale = Boolean(r.is_for_sale);
+  const isForRent = Boolean(r.is_for_rent);
+  const hideRentPrices = isForSale && !isForRent;
+  const dealType =
+    r.deal_type
+    ?? (isForRent && !isForSale
+      ? "rent"
+      : isForSale && !isForRent
+        ? "sale"
+        : r.price_per_hour != null || r.price_per_week != null || r.price_per_month != null
+          ? "rent"
+          : "sale");
+
   return {
     id: r.id,
     ownerId: r.owner_id,
     owner_id: r.owner_id,
     name: r.name,
-    dealType: inferredDealType,
-    deal_type: inferredDealType,
+    title: r.name,
+    dealType,
+    deal_type: dealType,
     description: r.description ?? "",
     status: r.status ?? null,
-    isForSale: Boolean(r.is_for_sale),
-    is_for_sale: Boolean(r.is_for_sale),
-    isForRent: Boolean(r.is_for_rent),
-    is_for_rent: Boolean(r.is_for_rent),
+    isForSale,
+    is_for_sale: isForSale,
+    isForRent,
+    is_for_rent: isForRent,
     salePrice: r.sale_price != null ? Number(r.sale_price) : null,
     sale_price: r.sale_price != null ? Number(r.sale_price) : null,
-    weekdayPriceHour: r.weekday_price_hour != null ? Number(r.weekday_price_hour) : null,
-    weekday_price_hour: r.weekday_price_hour != null ? Number(r.weekday_price_hour) : null,
-    weekdayPriceWeek: r.weekday_price_week != null ? Number(r.weekday_price_week) : null,
-    weekday_price_week: r.weekday_price_week != null ? Number(r.weekday_price_week) : null,
-    weekdayPriceMonth: r.weekday_price_month != null ? Number(r.weekday_price_month) : null,
-    weekday_price_month: r.weekday_price_month != null ? Number(r.weekday_price_month) : null,
-    weekendPriceHour: r.weekend_price_hour != null ? Number(r.weekend_price_hour) : null,
-    weekend_price_hour: r.weekend_price_hour != null ? Number(r.weekend_price_hour) : null,
-    weekendPriceWeek: r.weekend_price_week != null ? Number(r.weekend_price_week) : null,
-    weekend_price_week: r.weekend_price_week != null ? Number(r.weekend_price_week) : null,
-    weekendPriceMonth: r.weekend_price_month != null ? Number(r.weekend_price_month) : null,
-    weekend_price_month: r.weekend_price_month != null ? Number(r.weekend_price_month) : null,
-    holidayPriceHour: r.holiday_price_hour != null ? Number(r.holiday_price_hour) : null,
-    holiday_price_hour: r.holiday_price_hour != null ? Number(r.holiday_price_hour) : null,
-    holidayPriceWeek: r.holiday_price_week != null ? Number(r.holiday_price_week) : null,
-    holiday_price_week: r.holiday_price_week != null ? Number(r.holiday_price_week) : null,
-    holidayPriceMonth: r.holiday_price_month != null ? Number(r.holiday_price_month) : null,
-    holiday_price_month: r.holiday_price_month != null ? Number(r.holiday_price_month) : null,
-    price: r.price != null ? Number(r.price) : null,
-    pricePerHour: r.price_per_hour != null ? Number(r.price_per_hour) : null,
-    price_per_hour: r.price_per_hour != null ? Number(r.price_per_hour) : null,
-    pricePerWeek: r.price_per_week != null ? Number(r.price_per_week) : null,
-    price_per_week: r.price_per_week != null ? Number(r.price_per_week) : null,
-    pricePerMonth: r.price_per_month != null ? Number(r.price_per_month) : null,
-    price_per_month: r.price_per_month != null ? Number(r.price_per_month) : null,
+    weekdayPriceHour: hideRentPrices || r.weekday_price_hour == null ? null : Number(r.weekday_price_hour),
+    weekday_price_hour: hideRentPrices || r.weekday_price_hour == null ? null : Number(r.weekday_price_hour),
+    weekdayPriceDay: hideRentPrices || r.weekday_price_day == null ? null : Number(r.weekday_price_day),
+    weekday_price_day: hideRentPrices || r.weekday_price_day == null ? null : Number(r.weekday_price_day),
+    weekdayPriceWeek: hideRentPrices || r.weekday_price_week == null ? null : Number(r.weekday_price_week),
+    weekday_price_week: hideRentPrices || r.weekday_price_week == null ? null : Number(r.weekday_price_week),
+    weekdayPriceMonth: hideRentPrices || r.weekday_price_month == null ? null : Number(r.weekday_price_month),
+    weekday_price_month: hideRentPrices || r.weekday_price_month == null ? null : Number(r.weekday_price_month),
+    weekendPriceHour: hideRentPrices || r.weekend_price_hour == null ? null : Number(r.weekend_price_hour),
+    weekend_price_hour: hideRentPrices || r.weekend_price_hour == null ? null : Number(r.weekend_price_hour),
+    weekendPriceDay: hideRentPrices || r.weekend_price_day == null ? null : Number(r.weekend_price_day),
+    weekend_price_day: hideRentPrices || r.weekend_price_day == null ? null : Number(r.weekend_price_day),
+    weekendPriceWeek: hideRentPrices || r.weekend_price_week == null ? null : Number(r.weekend_price_week),
+    weekend_price_week: hideRentPrices || r.weekend_price_week == null ? null : Number(r.weekend_price_week),
+    weekendPriceMonth: hideRentPrices || r.weekend_price_month == null ? null : Number(r.weekend_price_month),
+    weekend_price_month: hideRentPrices || r.weekend_price_month == null ? null : Number(r.weekend_price_month),
+    holidayPriceHour: hideRentPrices || r.holiday_price_hour == null ? null : Number(r.holiday_price_hour),
+    holiday_price_hour: hideRentPrices || r.holiday_price_hour == null ? null : Number(r.holiday_price_hour),
+    holidayPriceDay: hideRentPrices || r.holiday_price_day == null ? null : Number(r.holiday_price_day),
+    holiday_price_day: hideRentPrices || r.holiday_price_day == null ? null : Number(r.holiday_price_day),
+    holidayPriceWeek: hideRentPrices || r.holiday_price_week == null ? null : Number(r.holiday_price_week),
+    holiday_price_week: hideRentPrices || r.holiday_price_week == null ? null : Number(r.holiday_price_week),
+    holidayPriceMonth: hideRentPrices || r.holiday_price_month == null ? null : Number(r.holiday_price_month),
+    holiday_price_month: hideRentPrices || r.holiday_price_month == null ? null : Number(r.holiday_price_month),
+    price: hideRentPrices
+      ? (r.sale_price != null ? Number(r.sale_price) : r.price != null ? Number(r.price) : null)
+      : r.price != null
+        ? Number(r.price)
+        : null,
+    pricePerHour: null,
+    price_per_hour: null,
+    pricePerDay: null,
+    price_per_day: null,
+    pricePerWeek: null,
+    price_per_week: null,
+    pricePerMonth: null,
+    price_per_month: null,
     createdAt: r.created_at,
     created_at: r.created_at,
+    groupId: r.group_id ?? null,
+    group_id: r.group_id ?? null,
+    groupName: r.group_name ?? null,
+    group_name: r.group_name ?? null,
     updatedAt: r.updated_at,
     updated_at: r.updated_at,
     media: mediaMap.get(r.id) ?? [],
   };
 }
 
-async function hasDealTypeColumn() {
-  if (dealTypeColumnExistsCache !== null) {
-    return dealTypeColumnExistsCache;
+async function listCatalogItemGroups(req, res) {
+  try {
+    await ensureItemGroupsSchema();
+    const ownerId = resolveCatalogOwnerId(req);
+    if (!ownerId) {
+      return res.status(400).json({ error: "ownerId query parameter is required" });
+    }
+
+    const result = await pool.query(
+      `SELECT g.id, g.name, g.sort_order,
+              COUNT(i.id)::int AS item_count
+       FROM item_groups g
+       LEFT JOIN items i
+         ON i.group_id = g.id
+        AND i.owner_id = g.owner_id
+        AND ${clientCatalogStatusSql("i")}
+       WHERE g.owner_id = $1::uuid
+       GROUP BY g.id
+       HAVING COUNT(i.id) > 0
+       ORDER BY g.sort_order ASC, g.name ASC;`,
+      [ownerId],
+    );
+
+    return res.json({
+      groups: result.rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        sortOrder: row.sort_order,
+        itemCount: Number(row.item_count),
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
-  const result = await pool.query(
-    `SELECT EXISTS (
-       SELECT 1
-       FROM information_schema.columns
-       WHERE table_schema = 'public'
-         AND table_name = 'items'
-         AND column_name = 'deal_type'
-     ) AS exists;`,
-    [],
-  );
-  dealTypeColumnExistsCache = Boolean(result.rows[0]?.exists);
-  return dealTypeColumnExistsCache;
 }
 
 function parseItemPayload(body) {
@@ -174,16 +240,20 @@ function parseItemPayload(body) {
   const isForRent = parseBoolean(b.is_for_rent ?? b.isForRent);
   const salePrice = parseDecimal(b.sale_price ?? b.salePrice);
   const weekdayPriceHour = parseDecimal(b.weekday_price_hour ?? b.weekdayPriceHour);
+  const weekdayPriceDay = parseDecimal(b.weekday_price_day ?? b.weekdayPriceDay);
   const weekdayPriceWeek = parseDecimal(b.weekday_price_week ?? b.weekdayPriceWeek);
   const weekdayPriceMonth = parseDecimal(b.weekday_price_month ?? b.weekdayPriceMonth);
   const weekendPriceHour = parseDecimal(b.weekend_price_hour ?? b.weekendPriceHour);
+  const weekendPriceDay = parseDecimal(b.weekend_price_day ?? b.weekendPriceDay);
   const weekendPriceWeek = parseDecimal(b.weekend_price_week ?? b.weekendPriceWeek);
   const weekendPriceMonth = parseDecimal(b.weekend_price_month ?? b.weekendPriceMonth);
   const holidayPriceHour = parseDecimal(b.holiday_price_hour ?? b.holidayPriceHour);
+  const holidayPriceDay = parseDecimal(b.holiday_price_day ?? b.holidayPriceDay);
   const holidayPriceWeek = parseDecimal(b.holiday_price_week ?? b.holidayPriceWeek);
   const holidayPriceMonth = parseDecimal(b.holiday_price_month ?? b.holidayPriceMonth);
   const price = parseDecimal(b.price);
   const pricePerHour = parseDecimal(b.price_per_hour ?? b.pricePerHour ?? b.price_hour ?? b.priceHour);
+  const pricePerDay = parseDecimal(b.price_per_day ?? b.pricePerDay ?? b.price_day ?? b.priceDay);
   const pricePerWeek = parseDecimal(b.price_per_week ?? b.pricePerWeek ?? b.price_week ?? b.priceWeek);
   const pricePerMonth = parseDecimal(b.price_per_month ?? b.pricePerMonth ?? b.price_month ?? b.priceMonth);
 
@@ -198,16 +268,20 @@ function parseItemPayload(body) {
     isForRent,
     salePrice,
     weekdayPriceHour,
+    weekdayPriceDay,
     weekdayPriceWeek,
     weekdayPriceMonth,
     weekendPriceHour,
+    weekendPriceDay,
     weekendPriceWeek,
     weekendPriceMonth,
     holidayPriceHour,
+    holidayPriceDay,
     holidayPriceWeek,
     holidayPriceMonth,
     price,
     pricePerHour,
+    pricePerDay,
     pricePerWeek,
     pricePerMonth,
   };
@@ -216,12 +290,15 @@ function parseItemPayload(body) {
 function hasAnyRentPrice(payload) {
   return [
     payload.weekdayPriceHour,
+    payload.weekdayPriceDay,
     payload.weekdayPriceWeek,
     payload.weekdayPriceMonth,
     payload.weekendPriceHour,
+    payload.weekendPriceDay,
     payload.weekendPriceWeek,
     payload.weekendPriceMonth,
     payload.holidayPriceHour,
+    payload.holidayPriceDay,
     payload.holidayPriceWeek,
     payload.holidayPriceMonth,
   ].some((v) => v != null);
@@ -229,29 +306,29 @@ function hasAnyRentPrice(payload) {
 
 async function listItems(req, res) {
   try {
-    const ownerId = req.user?.id;
-    const isOwner = req.user?.role === "owner";
-    if (isOwner && !ownerId) {
+    await ensureItemGroupsSchema();
+    const scopedOwnerId = getScopedOwnerId(req);
+    if (isOwnerLikeRole(req) && !scopedOwnerId) {
       return res.status(401).json({ error: "Unauthorized owner context" });
     }
 
+    const ownerId = resolveCatalogOwnerId(req);
+    if (!ownerId) {
+      return res.status(400).json({ error: "ownerId query parameter is required" });
+    }
+
     const withDealType = await hasDealTypeColumn();
-    const dealTypeSelect = withDealType ? ", deal_type" : "";
+    const dealTypeSelect = withDealType ? ", i.deal_type" : "";
     const result = await pool.query(
-      `SELECT id, owner_id, name${dealTypeSelect}, description, status,
-              is_for_sale, is_for_rent, sale_price,
-              weekday_price_hour, weekday_price_week, weekday_price_month,
-              weekend_price_hour, weekend_price_week, weekend_price_month,
-              holiday_price_hour, holiday_price_week, holiday_price_month,
-              price, price_per_hour, price_per_week, price_per_month,
-              created_at, updated_at
-       FROM items
-       WHERE ($1::uuid IS NULL OR owner_id = $1::uuid)
-       ORDER BY created_at DESC;`,
-      [isOwner ? ownerId : null],
+      `SELECT ${CATALOG_ITEM_SELECT}${dealTypeSelect}
+       ${CATALOG_ITEM_FROM}
+       WHERE i.owner_id = $1::uuid
+         AND ${clientCatalogStatusSql("i")}
+       ORDER BY g.name ASC NULLS LAST, i.created_at DESC;`,
+      [ownerId],
     );
 
-    const mediaMap = await fetchItemMediaMap(pool, result.rows.map((r) => r.id), isOwner ? ownerId : null);
+    const mediaMap = await fetchItemMediaMap(pool, result.rows.map((r) => r.id), ownerId);
     const items = result.rows.map((r) => mapItemRow(r, mediaMap));
 
     return res.json({ items });
@@ -281,7 +358,9 @@ async function getItemAvailability(req, res) {
 
     const itemCheck = await pool.query(
       `SELECT 1
-       FROM items WHERE id = $1;`,
+       FROM items
+       WHERE id = $1
+         AND ${clientCatalogStatusSql()};`,
       [itemId],
     );
     if (itemCheck.rowCount === 0) {
@@ -313,17 +392,57 @@ async function getItemAvailability(req, res) {
   }
 }
 
+async function getItemBookedSlots(req, res) {
+  try {
+    const { itemId } = req.params;
+    const ownerId = req.query.ownerId ?? null;
+
+    const itemCheck = await pool.query(
+      `SELECT id
+       FROM items
+       WHERE id = $1
+         AND ($2::uuid IS NULL OR owner_id = $2::uuid)
+         AND ${clientCatalogStatusSql()};`,
+      [itemId, ownerId],
+    );
+    if (itemCheck.rowCount === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, start_at, end_at, status
+       FROM bookings
+       WHERE item_id = $1
+         AND type = 'rent'
+         AND status IN ('pending', 'confirmed')
+       ORDER BY start_at ASC;`,
+      [itemId],
+    );
+
+    return res.json({
+      bookedSlots: result.rows.map((row) => ({
+        id: row.id,
+        startAt: row.start_at,
+        endAt: row.end_at,
+        status: row.status,
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 async function getItemRentalPrice(req, res) {
   try {
     const { itemId } = req.params;
-    const ownerId = req.user?.id;
-    const isOwner = req.user?.role === "owner";
+    const scopedOwnerId = getScopedOwnerId(req);
     const dayType = req.query.dayType ? req.query.dayType.toString().toLowerCase() : null;
     const date = req.query.date ? req.query.date.toString() : null;
     const period = (req.query.period ?? "").toString().toLowerCase();
 
-    if (!["hour", "week", "month"].includes(period)) {
-      return res.status(400).json({ error: "period must be hour, week or month" });
+    if (!["hour", "day", "week", "month"].includes(period)) {
+      return res.status(400).json({ error: "period must be hour, day, week or month" });
     }
     if (!dayType && !date) {
       return res.status(400).json({ error: "Either dayType or date is required" });
@@ -334,13 +453,14 @@ async function getItemRentalPrice(req, res) {
 
     const result = await pool.query(
       `SELECT id, owner_id, is_for_rent,
-              weekday_price_hour, weekday_price_week, weekday_price_month,
-              weekend_price_hour, weekend_price_week, weekend_price_month,
-              holiday_price_hour, holiday_price_week, holiday_price_month
+              weekday_price_hour, weekday_price_day, weekday_price_week, weekday_price_month,
+              weekend_price_hour, weekend_price_day, weekend_price_week, weekend_price_month,
+              holiday_price_hour, holiday_price_day, holiday_price_week, holiday_price_month
        FROM items
        WHERE id = $1
-         AND ($2::uuid IS NULL OR owner_id = $2::uuid);`,
-      [itemId, isOwner ? ownerId : null],
+         AND ($2::uuid IS NULL OR owner_id = $2::uuid)
+         AND ${clientCatalogStatusSql()};`,
+      [itemId, scopedOwnerId],
     );
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Item not found" });
@@ -377,29 +497,32 @@ async function getItemRentalPrice(req, res) {
 async function getItemById(req, res) {
   try {
     const { itemId } = req.params;
-    const ownerId = req.user?.id;
-    const isOwner = req.user?.role === "owner";
+    const ownerId = resolveCatalogOwnerId(req);
+    if (!ownerId) {
+      return res.status(400).json({ error: "ownerId query parameter is required" });
+    }
     const withDealType = await hasDealTypeColumn();
     const dealTypeSelect = withDealType ? ", deal_type" : "";
     const result = await pool.query(
       `SELECT id, owner_id, name${dealTypeSelect}, description, status,
               is_for_sale, is_for_rent, sale_price,
-              weekday_price_hour, weekday_price_week, weekday_price_month,
-              weekend_price_hour, weekend_price_week, weekend_price_month,
-              holiday_price_hour, holiday_price_week, holiday_price_month,
-              price, price_per_hour, price_per_week, price_per_month,
+              weekday_price_hour, weekday_price_day, weekday_price_week, weekday_price_month,
+              weekend_price_hour, weekend_price_day, weekend_price_week, weekend_price_month,
+              holiday_price_hour, holiday_price_day, holiday_price_week, holiday_price_month,
+              price, price_per_hour, price_per_day, price_per_week, price_per_month,
               created_at, updated_at
        FROM items
        WHERE id = $1
-         AND ($2::uuid IS NULL OR owner_id = $2::uuid);`,
-      [itemId, isOwner ? ownerId : null],
+         AND owner_id = $2::uuid
+         AND ${clientCatalogStatusSql()};`,
+      [itemId, ownerId],
     );
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Item not found" });
     }
 
-    const mediaMap = await fetchItemMediaMap(pool, [result.rows[0].id], isOwner ? ownerId : null);
+    const mediaMap = await fetchItemMediaMap(pool, [result.rows[0].id], ownerId);
     return res.json({ item: mapItemRow(result.rows[0], mediaMap) });
   } catch (err) {
     console.error(err);
@@ -416,18 +539,22 @@ async function createItem(req, res) {
       isForRent,
       salePrice,
       weekdayPriceHour,
+      weekdayPriceDay,
       weekdayPriceWeek,
       weekdayPriceMonth,
       weekendPriceHour,
+      weekendPriceDay,
       weekendPriceWeek,
       weekendPriceMonth,
       holidayPriceHour,
+      holidayPriceDay,
       holidayPriceWeek,
       holidayPriceMonth,
       description,
       status,
       price,
       pricePerHour,
+      pricePerDay,
       pricePerWeek,
       pricePerMonth,
     } = payload;
@@ -449,11 +576,11 @@ async function createItem(req, res) {
       return res.status(400).json({ error: "name is required" });
     }
     if (
-      Number.isNaN(price) || Number.isNaN(pricePerHour) || Number.isNaN(pricePerWeek) || Number.isNaN(pricePerMonth)
+      Number.isNaN(price) || Number.isNaN(pricePerHour) || Number.isNaN(pricePerDay) || Number.isNaN(pricePerWeek) || Number.isNaN(pricePerMonth)
       || Number.isNaN(salePrice)
-      || Number.isNaN(weekdayPriceHour) || Number.isNaN(weekdayPriceWeek) || Number.isNaN(weekdayPriceMonth)
-      || Number.isNaN(weekendPriceHour) || Number.isNaN(weekendPriceWeek) || Number.isNaN(weekendPriceMonth)
-      || Number.isNaN(holidayPriceHour) || Number.isNaN(holidayPriceWeek) || Number.isNaN(holidayPriceMonth)
+      || Number.isNaN(weekdayPriceHour) || Number.isNaN(weekdayPriceDay) || Number.isNaN(weekdayPriceWeek) || Number.isNaN(weekdayPriceMonth)
+      || Number.isNaN(weekendPriceHour) || Number.isNaN(weekendPriceDay) || Number.isNaN(weekendPriceWeek) || Number.isNaN(weekendPriceMonth)
+      || Number.isNaN(holidayPriceHour) || Number.isNaN(holidayPriceDay) || Number.isNaN(holidayPriceWeek) || Number.isNaN(holidayPriceMonth)
     ) {
       return res.status(400).json({ error: "price fields must be numbers" });
     }
@@ -461,9 +588,9 @@ async function createItem(req, res) {
       return res.status(400).json({ error: "salePrice is required when isForSale is true" });
     }
     if (isForRent === true && !hasAnyRentPrice({
-      weekdayPriceHour, weekdayPriceWeek, weekdayPriceMonth,
-      weekendPriceHour, weekendPriceWeek, weekendPriceMonth,
-      holidayPriceHour, holidayPriceWeek, holidayPriceMonth,
+      weekdayPriceHour, weekdayPriceDay, weekdayPriceWeek, weekdayPriceMonth,
+      weekendPriceHour, weekendPriceDay, weekendPriceWeek, weekendPriceMonth,
+      holidayPriceHour, holidayPriceDay, holidayPriceWeek, holidayPriceMonth,
     })) {
       return res.status(400).json({ error: "At least one rent price is required when isForRent is true" });
     }
@@ -483,19 +610,19 @@ async function createItem(req, res) {
       `INSERT INTO items (
          id, owner_id, name, description, status,
          is_for_sale, is_for_rent, sale_price,
-         weekday_price_hour, weekday_price_week, weekday_price_month,
-         weekend_price_hour, weekend_price_week, weekend_price_month,
-         holiday_price_hour, holiday_price_week, holiday_price_month,
-         price, price_per_hour, price_per_week, price_per_month, created_at, updated_at
+         weekday_price_hour, weekday_price_day, weekday_price_week, weekday_price_month,
+         weekend_price_hour, weekend_price_day, weekend_price_week, weekend_price_month,
+         holiday_price_hour, holiday_price_day, holiday_price_week, holiday_price_month,
+         price, price_per_hour, price_per_day, price_per_week, price_per_month, created_at, updated_at
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27
        )
        RETURNING id, owner_id, name, description, status,
                  is_for_sale, is_for_rent, sale_price,
-                 weekday_price_hour, weekday_price_week, weekday_price_month,
-                 weekend_price_hour, weekend_price_week, weekend_price_month,
-                 holiday_price_hour, holiday_price_week, holiday_price_month,
-                 price, price_per_hour, price_per_week, price_per_month, created_at, updated_at;`,
+                 weekday_price_hour, weekday_price_day, weekday_price_week, weekday_price_month,
+                 weekend_price_hour, weekend_price_day, weekend_price_week, weekend_price_month,
+                 holiday_price_hour, holiday_price_day, holiday_price_week, holiday_price_month,
+                 price, price_per_hour, price_per_day, price_per_week, price_per_month, created_at, updated_at;`,
       [
         id,
         String(effectiveOwnerId),
@@ -506,16 +633,20 @@ async function createItem(req, res) {
         isForRent === true,
         salePrice,
         weekdayPriceHour,
+        weekdayPriceDay,
         weekdayPriceWeek,
         weekdayPriceMonth,
         weekendPriceHour,
+        weekendPriceDay,
         weekendPriceWeek,
         weekendPriceMonth,
         holidayPriceHour,
+        holidayPriceDay,
         holidayPriceWeek,
         holidayPriceMonth,
         price,
         pricePerHour,
+        pricePerDay,
         pricePerWeek,
         pricePerMonth,
         now,
@@ -546,23 +677,22 @@ async function updateItem(req, res) {
     if (mediaResult.error) {
       return res.status(400).json({ error: mediaResult.error });
     }
-    const ownerId = req.user?.id;
-    const isOwner = req.user?.role === "owner";
+    const scopedOwnerId = getScopedOwnerId(req);
     const existing = await pool.query(
       `SELECT id, owner_id, is_for_sale, is_for_rent, sale_price,
-              weekday_price_hour, weekday_price_week, weekday_price_month,
-              weekend_price_hour, weekend_price_week, weekend_price_month,
-              holiday_price_hour, holiday_price_week, holiday_price_month
+              weekday_price_hour, weekday_price_day, weekday_price_week, weekday_price_month,
+              weekend_price_hour, weekend_price_day, weekend_price_week, weekend_price_month,
+              holiday_price_hour, holiday_price_day, holiday_price_week, holiday_price_month
        FROM items
        WHERE id = $1
          AND ($2::uuid IS NULL OR owner_id = $2::uuid);`,
-      [itemId, isOwner ? ownerId : null],
+      [itemId, scopedOwnerId],
     );
     if (existing.rowCount === 0) {
       return res.status(404).json({ error: "Item not found" });
     }
 
-    if (updates.ownerId != null && req.user?.role !== "owner") {
+    if (updates.ownerId != null && !isOwnerLikeRole(req)) {
       if (!isUuid(String(updates.ownerId))) {
         return res.status(400).json({ error: "owner_id must be a valid UUID" });
       }
@@ -578,12 +708,13 @@ async function updateItem(req, res) {
     if (
       Number.isNaN(updates.price)
       || Number.isNaN(updates.pricePerHour)
+      || Number.isNaN(updates.pricePerDay)
       || Number.isNaN(updates.pricePerWeek)
       || Number.isNaN(updates.pricePerMonth)
       || Number.isNaN(updates.salePrice)
-      || Number.isNaN(updates.weekdayPriceHour) || Number.isNaN(updates.weekdayPriceWeek) || Number.isNaN(updates.weekdayPriceMonth)
-      || Number.isNaN(updates.weekendPriceHour) || Number.isNaN(updates.weekendPriceWeek) || Number.isNaN(updates.weekendPriceMonth)
-      || Number.isNaN(updates.holidayPriceHour) || Number.isNaN(updates.holidayPriceWeek) || Number.isNaN(updates.holidayPriceMonth)
+      || Number.isNaN(updates.weekdayPriceHour) || Number.isNaN(updates.weekdayPriceDay) || Number.isNaN(updates.weekdayPriceWeek) || Number.isNaN(updates.weekdayPriceMonth)
+      || Number.isNaN(updates.weekendPriceHour) || Number.isNaN(updates.weekendPriceDay) || Number.isNaN(updates.weekendPriceWeek) || Number.isNaN(updates.weekendPriceMonth)
+      || Number.isNaN(updates.holidayPriceHour) || Number.isNaN(updates.holidayPriceDay) || Number.isNaN(updates.holidayPriceWeek) || Number.isNaN(updates.holidayPriceMonth)
     ) {
       return res.status(400).json({ error: "price fields must be numbers" });
     }
@@ -594,12 +725,15 @@ async function updateItem(req, res) {
       isForRent: updates.isForRent != null ? updates.isForRent : Boolean(current.is_for_rent),
       salePrice: updates.salePrice != null ? updates.salePrice : (current.sale_price != null ? Number(current.sale_price) : null),
       weekdayPriceHour: updates.weekdayPriceHour != null ? updates.weekdayPriceHour : (current.weekday_price_hour != null ? Number(current.weekday_price_hour) : null),
+      weekdayPriceDay: updates.weekdayPriceDay != null ? updates.weekdayPriceDay : (current.weekday_price_day != null ? Number(current.weekday_price_day) : null),
       weekdayPriceWeek: updates.weekdayPriceWeek != null ? updates.weekdayPriceWeek : (current.weekday_price_week != null ? Number(current.weekday_price_week) : null),
       weekdayPriceMonth: updates.weekdayPriceMonth != null ? updates.weekdayPriceMonth : (current.weekday_price_month != null ? Number(current.weekday_price_month) : null),
       weekendPriceHour: updates.weekendPriceHour != null ? updates.weekendPriceHour : (current.weekend_price_hour != null ? Number(current.weekend_price_hour) : null),
+      weekendPriceDay: updates.weekendPriceDay != null ? updates.weekendPriceDay : (current.weekend_price_day != null ? Number(current.weekend_price_day) : null),
       weekendPriceWeek: updates.weekendPriceWeek != null ? updates.weekendPriceWeek : (current.weekend_price_week != null ? Number(current.weekend_price_week) : null),
       weekendPriceMonth: updates.weekendPriceMonth != null ? updates.weekendPriceMonth : (current.weekend_price_month != null ? Number(current.weekend_price_month) : null),
       holidayPriceHour: updates.holidayPriceHour != null ? updates.holidayPriceHour : (current.holiday_price_hour != null ? Number(current.holiday_price_hour) : null),
+      holidayPriceDay: updates.holidayPriceDay != null ? updates.holidayPriceDay : (current.holiday_price_day != null ? Number(current.holiday_price_day) : null),
       holidayPriceWeek: updates.holidayPriceWeek != null ? updates.holidayPriceWeek : (current.holiday_price_week != null ? Number(current.holiday_price_week) : null),
       holidayPriceMonth: updates.holidayPriceMonth != null ? updates.holidayPriceMonth : (current.holiday_price_month != null ? Number(current.holiday_price_month) : null),
     };
@@ -624,29 +758,33 @@ async function updateItem(req, res) {
            is_for_rent = COALESCE($7, is_for_rent),
            sale_price = COALESCE($8, sale_price),
            weekday_price_hour = COALESCE($9, weekday_price_hour),
-           weekday_price_week = COALESCE($10, weekday_price_week),
-           weekday_price_month = COALESCE($11, weekday_price_month),
-           weekend_price_hour = COALESCE($12, weekend_price_hour),
-           weekend_price_week = COALESCE($13, weekend_price_week),
-           weekend_price_month = COALESCE($14, weekend_price_month),
-           holiday_price_hour = COALESCE($15, holiday_price_hour),
-           holiday_price_week = COALESCE($16, holiday_price_week),
-           holiday_price_month = COALESCE($17, holiday_price_month),
-           price = COALESCE($18, price),
-           price_per_hour = COALESCE($19, price_per_hour),
-           price_per_week = COALESCE($20, price_per_week),
-           price_per_month = COALESCE($21, price_per_month),
+           weekday_price_day = COALESCE($10, weekday_price_day),
+           weekday_price_week = COALESCE($11, weekday_price_week),
+           weekday_price_month = COALESCE($12, weekday_price_month),
+           weekend_price_hour = COALESCE($13, weekend_price_hour),
+           weekend_price_day = COALESCE($14, weekend_price_day),
+           weekend_price_week = COALESCE($15, weekend_price_week),
+           weekend_price_month = COALESCE($16, weekend_price_month),
+           holiday_price_hour = COALESCE($17, holiday_price_hour),
+           holiday_price_day = COALESCE($18, holiday_price_day),
+           holiday_price_week = COALESCE($19, holiday_price_week),
+           holiday_price_month = COALESCE($20, holiday_price_month),
+           price = COALESCE($21, price),
+           price_per_hour = COALESCE($22, price_per_hour),
+           price_per_day = COALESCE($23, price_per_day),
+           price_per_week = COALESCE($24, price_per_week),
+           price_per_month = COALESCE($25, price_per_month),
            updated_at = now()
        WHERE id = $1
        RETURNING id, owner_id, name, description, status,
                  is_for_sale, is_for_rent, sale_price,
-                 weekday_price_hour, weekday_price_week, weekday_price_month,
-                 weekend_price_hour, weekend_price_week, weekend_price_month,
-                 holiday_price_hour, holiday_price_week, holiday_price_month,
-                 price, price_per_hour, price_per_week, price_per_month, created_at, updated_at;`,
+                 weekday_price_hour, weekday_price_day, weekday_price_week, weekday_price_month,
+                 weekend_price_hour, weekend_price_day, weekend_price_week, weekend_price_month,
+                 holiday_price_hour, holiday_price_day, holiday_price_week, holiday_price_month,
+                 price, price_per_hour, price_per_day, price_per_week, price_per_month, created_at, updated_at;`,
       [
         itemId,
-        req.user?.role === "owner" ? null : updates.ownerId != null ? String(updates.ownerId) : null,
+        isOwnerLikeRole(req) ? null : updates.ownerId != null ? String(updates.ownerId) : null,
         updates.name != null ? String(updates.name) : null,
         updates.description != null ? String(updates.description) : null,
         updates.status != null ? String(updates.status) : null,
@@ -654,16 +792,20 @@ async function updateItem(req, res) {
         updates.isForRent,
         updates.salePrice,
         updates.weekdayPriceHour,
+        updates.weekdayPriceDay,
         updates.weekdayPriceWeek,
         updates.weekdayPriceMonth,
         updates.weekendPriceHour,
+        updates.weekendPriceDay,
         updates.weekendPriceWeek,
         updates.weekendPriceMonth,
         updates.holidayPriceHour,
+        updates.holidayPriceDay,
         updates.holidayPriceWeek,
         updates.holidayPriceMonth,
         updates.price,
         updates.pricePerHour,
+        updates.pricePerDay,
         updates.pricePerWeek,
         updates.pricePerMonth,
       ],
@@ -687,4 +829,61 @@ async function updateItem(req, res) {
   }
 }
 
-module.exports = { listItems, getItemById, createItem, updateItem, getItemAvailability, getItemRentalPrice };
+async function deleteItem(req, res) {
+  try {
+    const { itemId } = req.params;
+    const scopedOwnerId = getScopedOwnerId(req);
+
+    const existing = await pool.query(
+      `SELECT id, owner_id
+       FROM items
+       WHERE id = $1
+         AND ($2::uuid IS NULL OR owner_id = $2::uuid);`,
+      [itemId, scopedOwnerId],
+    );
+    if (existing.rowCount === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `DELETE FROM media
+         WHERE target_type = 'item'
+           AND target_id = $1;`,
+        [itemId],
+      );
+      await client.query(
+        `DELETE FROM items
+         WHERE id = $1;`,
+        [itemId],
+      );
+      await client.query("COMMIT");
+      return res.json({ deleted: true, itemId });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    if (err && err.code === "23503") {
+      return res.status(409).json({ error: "Cannot delete item with related bookings" });
+    }
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+module.exports = {
+  listItems,
+  listCatalogItemGroups,
+  getItemById,
+  createItem,
+  updateItem,
+  deleteItem,
+  getItemAvailability,
+  getItemBookedSlots,
+  getItemRentalPrice,
+};

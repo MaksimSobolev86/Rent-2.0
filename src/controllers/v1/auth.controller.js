@@ -1,6 +1,7 @@
 const { randomUUID } = require("crypto");
 const pool = require("../../db");
 const { hashPassword, verifyPassword } = require("../../utils/password");
+const { signOwnerSession } = require("../../utils/sessionToken");
 
 async function registerOwner(req, res) {
   try {
@@ -45,16 +46,18 @@ async function registerOwner(req, res) {
     );
 
     const row = result.rows[0];
+    const owner = {
+      id: row.id,
+      email: row.email,
+      firstName: row.first_name,
+      lastName: row.last_name,
+      phone: row.phone,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
     return res.status(201).json({
-      owner: {
-        id: row.id,
-        email: row.email,
-        firstName: row.first_name,
-        lastName: row.last_name,
-        phone: row.phone,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-      },
+      owner,
+      token: signOwnerSession(owner.id, "owner"),
     });
   } catch (err) {
     console.error(err);
@@ -82,21 +85,30 @@ async function loginOwner(req, res) {
     }
 
     const row = result.rows[0];
-    const validPassword = verifyPassword(password, row.password_hash);
+    const storedHash = row.password_hash;
+    if (!storedHash || !String(storedHash).startsWith("scrypt$")) {
+      return res.status(401).json({
+        error:
+          "Для этого email пароль не задан (старый тестовый аккаунт). Зарегистрируйтесь с новым email или сбросьте пароль через scripts/set-owner-password.js",
+      });
+    }
+    const validPassword = verifyPassword(password, storedHash);
     if (!validPassword) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
+    const owner = {
+      id: row.id,
+      email: row.email,
+      firstName: row.first_name,
+      lastName: row.last_name,
+      phone: row.phone,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
     return res.json({
-      owner: {
-        id: row.id,
-        email: row.email,
-        firstName: row.first_name,
-        lastName: row.last_name,
-        phone: row.phone,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-      },
+      owner,
+      token: signOwnerSession(owner.id, "owner"),
     });
   } catch (err) {
     console.error(err);

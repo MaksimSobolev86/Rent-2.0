@@ -1,0 +1,5 @@
+ALTER TABLE items
+  ADD COLUMN IF NOT EXISTS weekday_price_day NUMERIC(10,2),
+  ADD COLUMN IF NOT EXISTS weekend_price_day NUMERIC(10,2),
+  ADD COLUMN IF NOT EXISTS holiday_price_day NUMERIC(10,2),
+  ADD COLUMN IF NOT EXISTS price_per_day NUMERIC(10,2);
